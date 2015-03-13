@@ -164,7 +164,7 @@ main(void)
 	dup2(pipe_[0], STDIN_FILENO);
 
 	test_cgi_escape_special_chars();
-	//test_process_data();
+	test_process_data();
 	test_cgi_param_multiple();
 	test_cgi_process_form();
 
