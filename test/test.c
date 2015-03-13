@@ -94,7 +94,7 @@ test_cgi_param_multiple(void)
 formvars *
 _post(const char *post_data)
 {
-	const char length_str[20];
+	char length_str[20];
 	size_t length = strlen(post_data);
 
 	snprintf(length_str, sizeof(length_str),
