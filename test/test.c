@@ -5,7 +5,7 @@
 #include <string.h>
 #include <assert.h>
 
-#include "cgi.h"
+#include "../src/cgi.h"
 
 static void
 test_cgi_escape_special_chars(void)
