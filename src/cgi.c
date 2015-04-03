@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <sys/stat.h> /* for cgi_include() */
 
 #include "cgi.h"
 #include "error.h"
@@ -82,79 +83,58 @@ extern formvars *cookie_end;
 
 // Separates *query in name=value pairs, then gets each piece of result of them, storing
 // the result in the linked list global variable
-formvars *process_data(char *query, formvars **start, formvars **last, const char delim, const char sep)
+formvars *process_data(const char *query, formvars **start, formvars **last,
+	                   const char sep_value, const char sep_name)
 {
-	register size_t position = 0, total_len = 0, i = 0;
-	char *aux, *str_unesc;
-	formvars *data;
+	formvars *item;
+	const char *equal, *amp;
+	size_t name_len;
+	size_t value_len;
+	char *str_unesc;
+	const char *query_end = rawmemchr(query, '\0');
 
 	if (query == NULL)
 		return *start;
 
-	total_len = strlen(query);
-	aux = query;
-	while (*query) {
-		position = 0;
+	for ( ; query < query_end; query = amp + 1)
+	{
+		/* find end of name and value pair (with or without value) */
+		for (amp = query; (*amp != sep_name) && (*amp); ++amp);
 
-		data = (formvars *)malloc(sizeof(formvars));
-		if (!data)
+		/* find name and value separator (end of name) */
+		for (equal = query; (*equal != sep_value) && (equal < amp); ++equal);
+
+		name_len = equal - query;
+		value_len = (*equal == sep_value) ? amp - (equal + 1) : 0;
+
+		/* name could be zero-length if '&' or '=' is the first character.
+		 * value is of no use without name.
+		 */
+		if (! name_len)
+			continue;
+
+		/* allocate and initialise memory for new formvars */
+		item = (formvars *)calloc(1, sizeof(formvars));
+		if (! item)
 			libcgi_error(E_MEMORY, "%s, line %s", __FILE__, __LINE__);
 
-		memset(data, 0, sizeof(formvars));
-
-		// Scans the string for the next 'delim' character
-		while (*aux && (*aux != delim)) {
-			position++;
-			aux++;
-			i++;
-		}
-
-		if (*aux) {
-			aux++;
-			i++;
-		}
-
-		data->name = (char *)malloc(position+1);
-		if (data->name == NULL)
+		/* add name and value to new formvar item */
+		item->name = strndup(query, name_len);
+		if (! item->name)
 			libcgi_error(E_MEMORY, "%s, line %s", __FILE__, __LINE__);
 
-		strncpy(data->name, query, position);
-		data->name[position] = '\0';
+		if (value_len)
+		{
+			item->value = strndup(equal + 1, value_len);
+			if (! item->value)
+				libcgi_error(E_MEMORY, "%s, line %s", __FILE__, __LINE__);
 
-		query = aux;
-		position = 0;
-		while (*aux && (*aux != sep)) {
-			if ((*aux == '%') && (i + 2 <= total_len)) {
-				if (isalnum(aux[1]) && isalnum(aux[2])) {
-					aux += 2;
-					i += 2;
-					position++;
-				}
-			}
-			else
-				position++;
-
-			aux++;
-			i++;
+			str_unesc = cgi_unescape_special_chars(item->value);
+			free(item->value);
+			item->value = str_unesc;
 		}
 
-		if (*aux) {
-			aux++;
-			i++;
-		}
-
-		data->value = (char *)malloc(position+1);
-		if (data->value == NULL)
-			libcgi_error(E_MEMORY, "%s, line %s", __FILE__, __LINE__);
-
-		str_unesc = cgi_unescape_special_chars(query);
-		strncpy(data->value, str_unesc, position);
-		data->value[position] = '\0';
-		free(str_unesc);
-
-		slist_add(data, start, last);
-
-		query = aux;
+		slist_add(item, start, last);
 	}
 
 	return *start;
@@ -176,46 +156,55 @@ formvars *process_data(char *query, formvars **start, formvars **last, const cha
 **/
 formvars *cgi_process_form()
 {
-	char *method;
+	formvars *ret = NULL;
+	char *method = getenv("REQUEST_METHOD");
 
-	method = getenv("REQUEST_METHOD");
+	/* When METHOD has no contents, the default action is to process it as
+	 * GET method
+	 */
+	if (! method || ! strcasecmp("GET", method))
+	{
+		char *q = getenv("QUERY_STRING");
 
-	// When METHOD has no contents, the default action is to process it as GET method
-	if (method == NULL || !strcasecmp("GET", method)) {
-		char *dados;
-		dados =	getenv("QUERY_STRING");
-
-		// Sometimes, GET comes with not any data
-		if (dados == NULL || strlen(dados) < 1)
-			return NULL;
-
-		return process_data(dados, &formvars_start, &formvars_last, '=', '&');
+		// Sometimes, GET comes without any data
+		if (q && *q)
+			ret = process_data(q, &formvars_start, &formvars_last, '=', '&');
 	}
-	else if (!strcasecmp("POST", method)) {
+	else if (! strcasecmp("POST", method))
+	{
 		char *post_data;
-		char *tmp_data;
-		int content_length;
-		formvars *ret;
+		char *length_str;
+		char *trailing;
+		unsigned long length;
+		/* no current support for file uploads, so limit upload data size
+		 * 1 MB should be overkill for text data
+		 */
+		const unsigned long content_max = 1024 * 1024;
 
-		tmp_data = getenv("CONTENT_LENGTH");
-		if (tmp_data == NULL)
+		length_str = getenv("CONTENT_LENGTH");
+		if (! length_str || ! *length_str)
 			return NULL;
 
-		content_length = atoi(tmp_data);
+		/* validate length. not checking for negative as is cast unsigned. */
+		length = strtoul(length_str, &trailing, 10);
+		if (*trailing != '\0' || ! length || length > content_max)
+			return NULL;
 
-		post_data = (char *)malloc(content_length + 1);
-		if (post_data == NULL)
+		post_data = (char *)malloc(length + 1);
+		if (! post_data)
 			libcgi_error(E_MEMORY, "%s, line %s", __FILE__, __LINE__);
 
-		fread(post_data, content_length, 1, stdin);
-		post_data[content_length] = '\0';
+		if (fread(post_data, sizeof(char), length, stdin) == length)
+		{
+			post_data[length] = '\0';
+			ret = process_data(post_data, &formvars_start, &formvars_last,
+			                   '=', '&');
+		}
 
-		ret = process_data(post_data, &formvars_start, &formvars_last, '=', '&');
 		free(post_data);
-		return ret;
 	}
 
-	return NULL;
+	return ret;
 }
 
 /**
@@ -249,25 +238,60 @@ void cgi_fatal(const char *msg)
 * cgi_include("top_bar.htm");
 * \endcode
 */
-int cgi_include(const char *filename)
+int cgi_include(const char *path)
+/* flow: path != NULL
+ *       get file stats (for file size)
+ *       allocate memory for file contents
+ *       open file stream
+ *       read whole file into memory - includes shouldn't be huge
+ *       write to stdout
+ *       return number of bytes written (0 == failure)
+ */
 {
-	FILE *inc;
-	char buffer[255];
+	struct stat fstats;
+	FILE *fp = NULL;
+	char *fcontents = NULL;
+	size_t nwritten = 0;
 
-	if (!(inc = fopen(filename, "r"))) {
-		cgi_init_headers();
+	if (! path)
+		goto err_input;
 
-		libcgi_error(E_WARNING, "Failed to open include file <b>%s</b>", filename);
+	if (stat (path, &fstats) == -1)
+		goto err_input;
 
-		return 0;
-	}
+	if (! (fcontents = malloc (fstats.st_size)))
+		goto err_memory;
 
- 	while (fgets(buffer, 255, inc))
-		printf("%s", buffer);
+	if (! (fp = fopen (path, "r")))
+		goto err_input;
 
-	fclose(inc);
+	if (fread (fcontents, sizeof(char), fstats.st_size, fp) != fstats.st_size)
+		goto err_input;
 
-	return 1;
+	nwritten = fwrite (fcontents, sizeof(char), fstats.st_size, stdout);
+	if (nwritten != fstats.st_size)
+		goto err_output;
+
+cleanup:
+	if (fp)
+		fclose (fp);
+	free (fcontents);
+
+	return nwritten;
+
+err_input:
+	libcgi_error(E_WARNING, "%s: file error: %s", __FUNCTION__, path);
+	goto cleanup;
+
+err_output:
+	libcgi_error(E_WARNING, "%s: written: %u of %u",
+	             __FUNCTION__, nwritten, fstats.st_size);
+	goto cleanup;
+
+err_memory:
+	/* exit(EXIT_FAILURE) */
+	libcgi_error(E_MEMORY, "%s: %s", __FILE__, __FUNCTION__);
+	goto cleanup; /* silence compiler warnings */
 }
 
 /**
@@ -313,27 +337,32 @@ void cgi_init_headers()
 **/
 char *cgi_param_multiple(const char *name)
 {
-	static unsigned int counter = 0;
-	unsigned int pos = 0;
-	formvars *begin;
+	/* DFrostByte: caching of 'name' would allow beginning new name search
+	* without having to fetch all occurrences of previous.
+	*
+	* taking a formvars * parameter would be more flexible. if return was also
+	* formvars *, the function would work in the same way without any
+	* need for static variables which may be problematic in a shared lib
+	*/
+	static formvars *iter = NULL;
+	char *value;
 
-	begin = formvars_start;
+	if (! iter)
+		iter = formvars_start;
 
-	while (begin) {
-		if ((!strcasecmp(begin->name, name)) && (++pos > counter)) {
-			counter++;
-
-			return (begin->value);
+	for (value = NULL; iter; iter = iter->next)
+	{
+		/* DFrostByte: shouldn't really be case-insensitive */
+		if (! strcasecmp(iter->name, name))
+		{
+			value = iter->value;
+			iter = iter->next;
+			break;
 		}
-
-		begin = begin->next;
 	}
-
-	counter = 0;
-
-	return NULL;
+	/* both iter and value will be NULL if no match was found */
+	return value;
 }
-
 /**
 *  Recirects to the specified url.
 * Remember that you cannot send any header before this function, or it will not work.
@@ -403,14 +432,14 @@ void cgi_end()
 char *cgi_unescape_special_chars(const char *str)
 {
 	char *new, *write;
-	char c = *str;
+	char c;
 	char hex[2];
 
 	new = (char *)malloc(strlen(str) + 1);
 	if (! new)
 		libcgi_error(E_MEMORY, "%s, line %s", __FILE__, __LINE__);
 
-	for (write = new; c; ++str, ++write)
+	for (write = new; *str; ++str, ++write)
 	{
 		c = *str;
 
@@ -423,8 +452,8 @@ char *cgi_unescape_special_chars(const char *str)
 			 */
 			if (str[1])
 			{
-				hex[0] = hextable[str[1]];
-				hex[1] = hextable[str[2]];
+				hex[0] = hextable[(unsigned char)str[1]];
+				hex[1] = hextable[(unsigned char)str[2]];
 
 				/* valid hex characters? */
 				if (hex[0] != 0xFF && hex[1] != 0xFF)
@@ -437,6 +466,10 @@ char *cgi_unescape_special_chars(const char *str)
 
 		*write = c;
 	}
+	*write = '\0';
+
+	// free unused memory. no reason to fail.
+	new = realloc(new, strlen(new) + 1);
 
 	return new;
 }
@@ -447,17 +480,16 @@ char *cgi_unescape_special_chars(const char *str)
 * @return The new string
 * @see cgi_unescape_special_chars
 **/
-char *cgi_escape_special_chars(const unsigned char *str)
+char *cgi_escape_special_chars(const char *str)
 {
-	static const unsigned char hex[] = "0123456789ABCDEF";
-	int i, len;
-	unsigned char *new;
-
-	len = strlen(str);
+	static const char hex[] = "0123456789ABCDEF";
+	char *new;
+	int i;
+	size_t len = strlen(str);
 
 	// worst case scenario: every character would need to be escaped, requiring
 	// 3 times more memory than the original string.
-	new = (unsigned char*)malloc((len * 3) + 1);
+	new = (char*)malloc((len * 3) + 1);
 	if (! new)
 		libcgi_error(E_MEMORY, "%s, line %s", __FILE__, __LINE__);
 
@@ -468,13 +500,12 @@ char *cgi_escape_special_chars(const unsigned char *str)
 		else if (! isalnum(*str) && ! strchr("_-.", *str))
 		{
 			new[i++] = '%';
-			new[i++] = hex[*str >> 4];
-			new[i]   = hex[*str & 0x0F];
+			new[i++] = hex[(unsigned char)*str >> 4];
+			new[i]   = hex[(unsigned char)*str & 0x0F];
 		}
 		else
 			new[i] = *str;
 	}
-
 	new[i] = '\0';
 
 	// free unused memory. no reason to fail.
