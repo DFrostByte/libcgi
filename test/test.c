@@ -12,12 +12,6 @@ extern formvars *
 process_data(const char *query, formvars **start, formvars **last,
              const char sep_value, const char sep_name);
 
-extern void
-ltrim(char *);
-
-extern void
-rtrim(char *);
-
 static int pipe_[2];
 
 static void
@@ -189,7 +183,7 @@ _test_ltrim(void)
     {
         --n;
         strcpy(buf, before[n]);
-        ltrim(buf);
+        cgi_ltrim(buf);
         assert(! strcmp(buf, after[n]));
     }
 }
@@ -218,11 +212,11 @@ _test_rtrim(void)
     {
         --n;
         strcpy(buf, before[n]);
-        rtrim(buf);
+        cgi_rtrim(buf);
         assert(! strcmp(buf, after[n]));
 
         strcpy(buf, before[n]);
-        rtrim(buf);
+        cgi_rtrim(buf);
         assert(! strcmp(buf, after[n]));
     }
 }
